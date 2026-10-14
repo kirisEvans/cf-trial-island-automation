@@ -54,6 +54,8 @@ BossAutomation\BossAutomation.exe
 
 工具会不断执行：按一次 `E`、选择卡片、点击“召唤 Boss”，然后立即重复下一轮。它不会识别怪物状态，也不会自动打怪。
 
+<p><strong><span style="color:red; font-size:1.15em;">WIN + G 可以自动开枪，不影响自动放卡。</span></strong></p>
+
 ### 如何停止投卡
 
 你可以使用任意一种方式：

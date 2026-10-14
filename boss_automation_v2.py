@@ -1,6 +1,5 @@
 import ctypes
 import json
-import random
 import subprocess
 import sys
 import threading
@@ -10,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pyautogui
+import keyboard
 
 # 首次要选择的星级：1～6
 SELECTED_STAR = 1
@@ -41,20 +41,10 @@ SUMMON_BOSS_POSITION = (1347, 804)
 TASKBAR_INDEX = "4"
 
 # 网页没有连接时使用的默认值；网页提交后会以网页设置为准。
-REPEAT_COUNT = 1
 PROGRAM_OPEN_DELAY_SECONDS = 4
-INTERVAL_SECONDS = 4.0
-
-# “伤害占比”截图文件，须与本脚本位于同一目录
-TARGET_IMAGE = Path(__file__).with_name("damage_ratio.png")
-DAMAGE_RATIO_REGION = (580, 115, 140, 70)
-IMAGE_CHECK_INTERVAL = 0.04
-IMAGE_CONFIDENCE = 0.6
-STATUS_PRINT_INTERVAL = 1.0
+# 每轮只按一次 E，留出足够时间打开投卡界面。
+E_AFTER_OPEN_DELAY_SECONDS = 0.35
 PANEL_HEARTBEAT_TIMEOUT_SECONDS = 10.0
-
-# 图片必须连续消失这么久，才会松开鼠标。
-IMAGE_LOST_CONFIRM_SECONDS = 0.15
 
 # 所有鼠标操作共用一把锁，防止 click() 的 mouseUp() 冲掉长按。
 mouse_lock = threading.Lock()
@@ -70,7 +60,6 @@ active_config = {
     "mode": "card",
     "stars": SELECTED_STAR,
     "card": SELECTED_CARD,
-    "quantity": REPEAT_COUNT,
     "taskbar_index": int(TASKBAR_INDEX),
 }
 
@@ -203,12 +192,10 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             elif mode == "card":
                 stars = int(data["stars"])
                 card = int(data["card"])
-                quantity = int(data["quantity"])
                 taskbar_index = int(data["taskbarIndex"])
                 if (
                     stars not in STAR_POSITIONS
                     or card not in CARD_POSITIONS
-                    or not 1 <= quantity <= 999
                     or not 1 <= taskbar_index <= 9
                 ):
                     raise ValueError
@@ -216,7 +203,6 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                     "mode": mode,
                     "stars": stars,
                     "card": card,
-                    "quantity": quantity,
                     "taskbar_index": taskbar_index,
                 }
             else:
@@ -239,7 +225,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             message = "自动攻击设置已发送，即将启动。"
         else:
             print(
-                f"已收到控制面板设置：{stars} 星，第 {card} 张，共 {quantity} 次，"
+                f"已收到控制面板设置：{stars} 星，第 {card} 张，无限循环，"
                 f"任务栏第 {taskbar_index} 个程序。"
             )
             message = "设置已发送，自动化即将启动。"
@@ -277,12 +263,8 @@ def hide_console_window() -> None:
         pass
 
 
-def wait_or_stop(
-    seconds: float,
-    image_pause_event: threading.Event,
-    task_stop_event: threading.Event,
-) -> None:
-    """等待；图片检测期间暂停计时，控制面板可终止当前任务。"""
+def wait_or_stop(seconds: float, task_stop_event: threading.Event) -> None:
+    """等待；控制面板可随时终止当前任务。"""
     remaining = seconds
     last_time = time.monotonic()
 
@@ -292,118 +274,19 @@ def wait_or_stop(
         if task_stop_event.is_set():
             raise TaskStopped
 
-        if image_pause_event.is_set():
-            time.sleep(0.02)
-            last_time = time.monotonic()
-            continue
-
         now = time.monotonic()
         remaining -= now - last_time
         last_time = now
         time.sleep(0.02)
 
 
-def safe_click(x: int, y: int, pause_event: threading.Event) -> None:
-    """点击后，如仍在暂停状态，重新恢复鼠标左键长按。"""
+def safe_click(x: int, y: int) -> None:
+    """在鼠标锁保护下点击。"""
     with mouse_lock:
         pyautogui.click(x, y)
 
-        # pyautogui.click() 会发送 mouseUp()；此处恢复监控所需长按。
-        if pause_event.is_set():
-            pyautogui.mouseDown(button="left")
-            print("点击后仍处于暂停状态：已重新按住鼠标左键。")
-
-
-def monitor_damage_ratio(
-    stop_event: threading.Event,
-    pause_event: threading.Event,
-    battle_seen_event: threading.Event,
-) -> None:
-    """图片出现时长按并暂停；稳定消失后松开并恢复。"""
-    is_holding = False
-    image_missing_since = None
-    last_status_time = 0.0
-
-    print("图片检测已启动：等待检测“伤害占比”……")
-
-    try:
-        while not stop_event.is_set():
-            try:
-                found = pyautogui.locateOnScreen(
-                    str(TARGET_IMAGE),
-                    region=DAMAGE_RATIO_REGION,
-                    confidence=IMAGE_CONFIDENCE,
-                    grayscale=True,
-                ) is not None
-            except pyautogui.ImageNotFoundException:
-                found = False
-
-            now = time.monotonic()
-
-            if found:
-                image_missing_since = None
-                pause_event.set()
-                battle_seen_event.set()
-
-                with mouse_lock:
-                    if not is_holding:
-                        pyautogui.mouseDown(button="left")
-                        is_holding = True
-                        print("【检测到图片】已暂停，并按住鼠标左键。")
-            else:
-                if image_missing_since is None:
-                    image_missing_since = now
-
-                if now - image_missing_since >= IMAGE_LOST_CONFIRM_SECONDS:
-                    pause_event.clear()
-
-                    with mouse_lock:
-                        if is_holding:
-                            pyautogui.mouseUp(button="left")
-                            is_holding = False
-                            print("【图片已消失】松开鼠标左键，继续执行。")
-
-            if now - last_status_time >= STATUS_PRINT_INTERVAL:
-                if found:
-                    print("检测状态：已检测到图片，当前暂停并按住左键。")
-                elif pause_event.is_set():
-                    print("检测状态：图片短暂未识别，仍保持暂停与按住。")
-                else:
-                    print("检测状态：未检测到图片，正常运行中。")
-                last_status_time = now
-
-            time.sleep(IMAGE_CHECK_INTERVAL)
-
-    finally:
-        with mouse_lock:
-            if is_holding:
-                pyautogui.mouseUp(button="left")
-
-
-def wait_for_battle_end(
-    image_pause_event: threading.Event,
-    battle_seen_event: threading.Event,
-    task_stop_event: threading.Event,
-) -> None:
-    """战斗提示消失后立即继续；未检测到提示时才使用兜底间隔。"""
-    deadline = time.monotonic() + INTERVAL_SECONDS
-
-    while True:
-        if is_panel_closed():
-            raise PanelClosed
-        if task_stop_event.is_set():
-            raise TaskStopped
-
-        # 已进入战斗且“伤害占比”提示消失，说明可立即投放下一张卡。
-        if battle_seen_event.is_set() and not image_pause_event.is_set():
-            return
-        if time.monotonic() >= deadline:
-            return
-        time.sleep(0.02)
-
 
 def select_and_summon_boss(
-    image_pause_event: threading.Event,
     task_stop_event: threading.Event,
     first_time: bool,
     stars: int,
@@ -416,17 +299,17 @@ def select_and_summon_boss(
             raise ValueError("卡片只能设置为 1、2 或 3。")
 
         print(f"首次选择 {stars} 星……")
-        safe_click(*STAR_POSITIONS[stars], image_pause_event)
+        safe_click(*STAR_POSITIONS[stars])
 
-        wait_or_stop(0.1, image_pause_event, task_stop_event)
+        wait_or_stop(0.1, task_stop_event)
 
     card_x, card_y = CARD_POSITIONS[card]
-    safe_click(card_x, card_y, image_pause_event)
+    safe_click(card_x, card_y)
 
-    wait_or_stop(random.uniform(0.2, 0.3), image_pause_event, task_stop_event)
+    wait_or_stop(0.2, task_stop_event)
 
     print("正在点击召唤 Boss……")
-    safe_click(*SUMMON_BOSS_POSITION, image_pause_event)
+    safe_click(*SUMMON_BOSS_POSITION)
 
 
 def run(config: dict) -> None:
@@ -434,51 +317,35 @@ def run(config: dict) -> None:
     pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0.1
 
-    if not TARGET_IMAGE.exists():
-        raise FileNotFoundError(
-            f"找不到图片：{TARGET_IMAGE}\n"
-            "请将“伤害占比”的截图保存为 damage_ratio.png，并放到脚本同目录。"
-        )
-
-    stop_event = threading.Event()
-    image_pause_event = threading.Event()
-    battle_seen_event = threading.Event()
     task_stop_event = threading.Event()
     register_current_task(task_stop_event)
-    monitor_thread = threading.Thread(
-        target=monitor_damage_ratio,
-        args=(stop_event, image_pause_event, battle_seen_event),
-        daemon=True,
-    )
-    monitor_thread.start()
+    # 卡片循环运行时，空格键可立即终止循环，且不会传递给游戏。
+    space_hotkey = keyboard.add_hotkey("space", stop_current_task, suppress=True)
 
     try:
-        stars, card, repeat_count, taskbar_index = (
+        stars, card, taskbar_index = (
             config["stars"],
             config["card"],
-            config["quantity"],
             config["taskbar_index"],
         )
-        print("正在运行新版防误松开脚本。")
+        print("正在运行连续投卡循环。")
         print("将在 3 秒后开始。可通过控制面板终止当前任务。")
-        wait_or_stop(3, image_pause_event, task_stop_event)
+        wait_or_stop(3, task_stop_event)
 
         pyautogui.hotkey("win", str(taskbar_index))
         print(f"等待目标程序加载完成（{PROGRAM_OPEN_DELAY_SECONDS} 秒）……")
-        wait_or_stop(PROGRAM_OPEN_DELAY_SECONDS, image_pause_event, task_stop_event)
+        wait_or_stop(PROGRAM_OPEN_DELAY_SECONDS, task_stop_event)
 
         screen_width, screen_height = pyautogui.size()
         pyautogui.moveTo(screen_width // 2, screen_height // 2, duration=0.2)
 
         iteration = 0
-        while iteration < repeat_count:
+        while True:
             print("正在按下 E……")
             pyautogui.press("e")
 
-            wait_or_stop(0.5, image_pause_event, task_stop_event)
-            battle_seen_event.clear()
+            wait_or_stop(E_AFTER_OPEN_DELAY_SECONDS, task_stop_event)
             select_and_summon_boss(
-                image_pause_event,
                 task_stop_event,
                 first_time=(iteration == 0),
                 stars=stars,
@@ -487,20 +354,11 @@ def run(config: dict) -> None:
 
             iteration += 1
             print(f"已执行第 {iteration} 次")
-            wait_for_battle_end(
-                image_pause_event,
-                battle_seen_event,
-                task_stop_event,
-            )
 
     finally:
-        stop_event.set()
-        image_pause_event.clear()
         task_stop_event.clear()
         unregister_current_task(task_stop_event)
-        with mouse_lock:
-            pyautogui.mouseUp(button="left")
-        monitor_thread.join(timeout=0.5)
+        keyboard.remove_hotkey(space_hotkey)
 
 
 def run_auto_attack(config: dict) -> None:
@@ -516,7 +374,7 @@ def run_auto_attack(config: dict) -> None:
         taskbar_index = config["taskbar_index"]
         print(f"正在切换到任务栏第 {taskbar_index} 个程序……")
         pyautogui.hotkey("win", str(taskbar_index))
-        wait_or_stop(PROGRAM_OPEN_DELAY_SECONDS, threading.Event(), task_stop_event)
+        wait_or_stop(PROGRAM_OPEN_DELAY_SECONDS, task_stop_event)
 
         next_f_press = time.monotonic() + 10
         print("自动攻击已启动：按住鼠标左键，每 10 秒按一次 F。可通过控制面板终止。")
